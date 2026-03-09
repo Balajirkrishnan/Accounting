@@ -5,11 +5,10 @@
 // (Extensions > Apps Script) and save. Reload your spreadsheet
 // to see the "Accounting Tools" menu.
 //
-// WORKFLOW:
-// 1. Click "Accounting Tools" > "Import CSV from staging tab"
-//    (this creates the _CSV_Import tab if it doesn't exist)
-// 2. Paste your bank CSV into the _CSV_Import tab, starting at A1
-// 3. Click "Accounting Tools" > "Import CSV from staging tab" again
+// NEW WORKFLOW:
+// 1. Click "Accounting Tools" > "Import CSV..."
+// 2. A dialog opens — paste your CSV text directly into it
+// 3. Click "Import" in the dialog
 // 4. Data appears in the "main" tab with formatting applied
 // 5. Fill in the "Category" column (G) manually
 // ============================================================
@@ -19,11 +18,10 @@
 // ============================================================
 
 function onOpen() {
-  SpreadsheetApp.getActiveSpreadsheet()
-    .addMenu('Accounting Tools', [
-      { name: 'Import CSV from staging tab', functionName: 'runCsvImport' },
-      { name: 'Clear staging tab', functionName: 'clearStagingTab' }
-    ]);
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('Accounting Tools')
+    .addItem('Import CSV...', 'showImportDialog')
+    .addToUi();
 }
 
 function onInstall(e) {
@@ -34,9 +32,8 @@ function onInstall(e) {
 // SECTION 2: SHEET MANAGEMENT
 // ============================================================
 
-var MAIN_SHEET_NAME    = 'main';
-var STAGING_SHEET_NAME = '_CSV_Import';
-var INDEX_SHEET_NAME   = '_ID_Index';
+var MAIN_SHEET_NAME  = 'main';
+var INDEX_SHEET_NAME = '_ID_Index';
 
 var MAIN_HEADERS = ['Date', 'Type', 'Description', 'Amount', 'Status', 'Month', 'Category'];
 
@@ -44,35 +41,18 @@ function getOrCreateMainSheet(ss) {
   var sheet = ss.getSheetByName(MAIN_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(MAIN_SHEET_NAME);
-    // Write header row
     sheet.getRange(1, 1, 1, MAIN_HEADERS.length).setValues([MAIN_HEADERS]);
-    // Freeze header row
     sheet.setFrozenRows(1);
-    // Style header row
     var headerRange = sheet.getRange(1, 1, 1, MAIN_HEADERS.length);
     headerRange.setFontWeight('bold');
     headerRange.setBackground('#d9d9d9');
-    // Set column widths
-    sheet.setColumnWidth(1, 100); // Date
-    sheet.setColumnWidth(2, 80);  // Type
-    sheet.setColumnWidth(3, 350); // Description
-    sheet.setColumnWidth(4, 100); // Amount
-    sheet.setColumnWidth(5, 80);  // Status
-    sheet.setColumnWidth(6, 80);  // Month
-    sheet.setColumnWidth(7, 120); // Category
-  }
-  return sheet;
-}
-
-function getOrCreateStagingSheet(ss) {
-  var sheet = ss.getSheetByName(STAGING_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(STAGING_SHEET_NAME);
-    sheet.getRange('A1').setValue(
-      'Paste your bank CSV here starting at cell A1 (overwrite this text). ' +
-      'Row 1 must be the header row.'
-    );
-    sheet.setTabColor('#b7e1cd'); // light green to indicate staging area
+    sheet.setColumnWidth(1, 100);
+    sheet.setColumnWidth(2, 80);
+    sheet.setColumnWidth(3, 350);
+    sheet.setColumnWidth(4, 100);
+    sheet.setColumnWidth(5, 80);
+    sheet.setColumnWidth(6, 80);
+    sheet.setColumnWidth(7, 120);
   }
   return sheet;
 }
@@ -89,25 +69,15 @@ function getOrCreateIdIndexSheet(ss) {
 
 function applyMainSheetFormatting(mainSheet) {
   var lastRow = mainSheet.getLastRow();
-  if (lastRow < 2) return; // No data rows yet
+  if (lastRow < 2) return;
+  var dataRows = lastRow - 1;
 
-  var dataRows = lastRow - 1; // Exclude header
-
-  // Column A: Date format
   mainSheet.getRange(2, 1, dataRows, 1).setNumberFormat('MM/dd/yyyy');
+  mainSheet.getRange(2, 4, dataRows, 1).setNumberFormat('#,##0.00');
 
-  // Column D: Amount - number format, negative in red
-  var amountRange = mainSheet.getRange(2, 4, dataRows, 1);
-  amountRange.setNumberFormat('#,##0.00');
-
-  // Highlight negative amounts in red using conditional formatting
   var rules = mainSheet.getConditionalFormatRules();
-  // Only add the rule once (check if it already exists)
   var ruleExists = rules.some(function(r) {
-    var ranges = r.getRanges();
-    return ranges.some(function(rng) {
-      return rng.getColumn() === 4;
-    });
+    return r.getRanges().some(function(rng) { return rng.getColumn() === 4; });
   });
   if (!ruleExists) {
     var negativeRule = SpreadsheetApp.newConditionalFormatRule()
@@ -119,81 +89,73 @@ function applyMainSheetFormatting(mainSheet) {
     mainSheet.setConditionalFormatRules(rules);
   }
 
-  // Column G: Category - light yellow fill
   mainSheet.getRange(2, 7, dataRows, 1).setBackground('#fff9c4');
 }
 
 // ============================================================
-// SECTION 3: DATA PARSING HELPERS
+// SECTION 3: CSV PARSING (pure string — no Sheets involvement)
 // ============================================================
 
 /**
- * Parses a single quoted CSV line into an array of field values.
- * Handles: quoted fields, embedded commas inside quotes, escaped "" sequences.
- * Example: '"DATE","TRANSACTION TYPE","DESCRIPTION"' → ['DATE', 'TRANSACTION TYPE', 'DESCRIPTION']
+ * Parses a full CSV string into a 2D array of clean string values.
+ * Handles quoted fields, embedded commas, embedded newlines, and "" escapes.
+ * This runs entirely on the raw text — Sheets never touches the values.
  */
-function parseCSVLine(line) {
-  var fields = [];
+function parseCSVText(csvText) {
+  var rows = [];
+  var row  = [];
   var current = '';
   var inQuotes = false;
+  // Normalise line endings
+  var text = csvText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-  for (var i = 0; i < line.length; i++) {
-    var ch = line[i];
-    var nextCh = (i + 1 < line.length) ? line[i + 1] : '';
+  for (var i = 0; i < text.length; i++) {
+    var ch     = text[i];
+    var nextCh = (i + 1 < text.length) ? text[i + 1] : '';
 
-    if (ch === '"') {
-      if (inQuotes && nextCh === '"') {
-        // Escaped double-quote inside a quoted field: "" → "
-        current += '"';
-        i++; // skip the second quote
+    if (inQuotes) {
+      if (ch === '"' && nextCh === '"') {
+        current += '"';   // escaped quote "" → "
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false; // closing quote
       } else {
-        // Toggle quoted mode
-        inQuotes = !inQuotes;
+        current += ch;    // normal char inside quotes (including newlines)
       }
-    } else if (ch === ',' && !inQuotes) {
-      // Field separator outside quotes
-      fields.push(current);
-      current = '';
     } else {
-      current += ch;
+      if (ch === '"') {
+        inQuotes = true;  // opening quote
+      } else if (ch === ',') {
+        row.push(current.trim());
+        current = '';
+      } else if (ch === '\n') {
+        row.push(current.trim());
+        current = '';
+        if (row.some(function(f) { return f !== ''; })) {
+          rows.push(row); // only push non-blank rows
+        }
+        row = [];
+      } else {
+        current += ch;
+      }
     }
   }
-  // Push the last field
-  fields.push(current);
-
-  return fields;
-}
-
-/**
- * Reads all rows from column A of the staging sheet where each cell contains
- * one raw CSV line (as happens when Sheets doesn't auto-parse the paste).
- * Calls parseCSVLine() on each non-empty row and returns a 2D array.
- * Returns null if nothing could be parsed.
- */
-function reParseRawCSV(stagingSheet) {
-  var lastRow = stagingSheet.getLastRow();
-  if (lastRow < 1) return null;
-
-  var rawData = stagingSheet.getRange(1, 1, lastRow, 1).getValues();
-  var parsed = [];
-
-  for (var i = 0; i < rawData.length; i++) {
-    var cellText = String(rawData[i][0] || '').trim();
-    if (cellText === '') continue; // skip blank rows
-    var fields = parseCSVLine(cellText);
-    parsed.push(fields);
+  // Last field / last row
+  row.push(current.trim());
+  if (row.some(function(f) { return f !== ''; })) {
+    rows.push(row);
   }
 
-  return parsed.length > 0 ? parsed : null;
+  return rows;
 }
 
-/**
- * Parses a currency string like "-$78.00" or "$2,200.00" to a float.
- * Returns NaN if unparseable.
- */
+// ============================================================
+// SECTION 4: DATA HELPERS
+// ============================================================
+
 function parseCurrency(str) {
-  if (!str || typeof str !== 'string') return NaN;
-  str = str.trim();
+  if (!str) return NaN;
+  str = String(str).trim();
   var isNegative = str.charAt(0) === '-';
   if (isNegative) str = str.substring(1);
   str = str.replace(/\$/g, '').replace(/,/g, '');
@@ -201,265 +163,199 @@ function parseCurrency(str) {
   return isNegative ? -value : value;
 }
 
-/**
- * Parses a date string "MM/DD/YYYY" into a JavaScript Date.
- * Uses explicit year/month/day constructor to avoid timezone drift.
- * Returns null if unparseable.
- */
 function parseSheetDate(str) {
-  if (!str || typeof str !== 'string') return null;
-  var parts = str.trim().split('/');
+  if (!str) return null;
+  var parts = String(str).trim().split('/');
   if (parts.length !== 3) return null;
   var month = parseInt(parts[0], 10);
   var day   = parseInt(parts[1], 10);
   var year  = parseInt(parts[2], 10);
   if (isNaN(month) || isNaN(day) || isNaN(year)) return null;
-  return new Date(year, month - 1, day); // month is 0-indexed in JS
+  return new Date(year, month - 1, day);
 }
 
-/**
- * Returns "YYYY-MM" from a Date object for the Month column.
- */
 function toMonthKey(dateObj) {
   if (!dateObj) return '';
-  var year  = dateObj.getFullYear();
-  var month = dateObj.getMonth() + 1;
-  return year + '-' + (month < 10 ? '0' + month : month);
+  var y = dateObj.getFullYear();
+  var m = dateObj.getMonth() + 1;
+  return y + '-' + (m < 10 ? '0' + m : m);
 }
 
-/**
- * Normalizes description text: trims and collapses runs of
- * whitespace (spaces, tabs) into a single space.
- */
 function normalizeDescription(str) {
   if (!str) return '';
   return String(str).trim().replace(/\s+/g, ' ');
 }
 
 // ============================================================
-// SECTION 4: DUPLICATE DETECTION
+// SECTION 5: DUPLICATE DETECTION
 // ============================================================
 
-/**
- * Loads all known transaction IDs from _ID_Index into a Set.
- */
 function loadExistingIds(ss) {
   var indexSheet = getOrCreateIdIndexSheet(ss);
   var lastRow = indexSheet.getLastRow();
   var existingIds = new Set();
-  if (lastRow < 2) return existingIds; // Only header row, no data
+  if (lastRow < 2) return existingIds;
   var values = indexSheet.getRange(2, 1, lastRow - 1, 1).getValues();
-  values.forEach(function(row) {
-    if (row[0]) existingIds.add(String(row[0]));
-  });
+  values.forEach(function(r) { if (r[0]) existingIds.add(String(r[0])); });
   return existingIds;
 }
 
-/**
- * Appends new transaction IDs to the _ID_Index sheet in one batch write.
- */
 function saveNewIds(ss, newIds) {
   if (!newIds || newIds.length === 0) return;
   var indexSheet = getOrCreateIdIndexSheet(ss);
-  var lastRow = indexSheet.getLastRow();
-  var nextRow = lastRow + 1;
-  var data = newIds.map(function(id) { return [id]; });
-  indexSheet.getRange(nextRow, 1, data.length, 1).setValues(data);
+  var nextRow = indexSheet.getLastRow() + 1;
+  indexSheet.getRange(nextRow, 1, newIds.length, 1).setValues(
+    newIds.map(function(id) { return [id]; })
+  );
 }
 
-/**
- * Returns the effective unique key for a row.
- * Uses the ID column if present; otherwise generates a composite key.
- */
 function getRowKey(rowObj) {
-  var id = rowObj['ID'] || rowObj['id'] || '';
-  if (id && String(id).trim() !== '') {
-    return String(id).trim();
-  }
-  // Fallback composite key
-  var date   = rowObj['DATE'] || rowObj['Date'] || '';
-  var desc   = rowObj['DESCRIPTION'] || rowObj['Description'] || '';
-  var amount = rowObj['AMOUNT'] || rowObj['Amount'] || '';
-  return [date, desc, amount].join('|');
+  var id = rowObj['ID'] || '';
+  if (id.trim() !== '') return id.trim();
+  return [rowObj['DATE'] || '', rowObj['DESCRIPTION'] || '', rowObj['AMOUNT'] || ''].join('|');
 }
 
 // ============================================================
-// SECTION 5: IMPORT ORCHESTRATOR
+// SECTION 6: HTML DIALOG — paste CSV as raw text
+// ============================================================
+
+function showImportDialog() {
+  var html = HtmlService.createHtmlOutput(
+    '<!DOCTYPE html>' +
+    '<html>' +
+    '<head>' +
+    '<style>' +
+    '  body { font-family: Arial, sans-serif; margin: 12px; font-size: 13px; }' +
+    '  textarea { width: 100%; height: 320px; font-size: 11px; font-family: monospace;' +
+    '             box-sizing: border-box; border: 1px solid #ccc; padding: 6px; }' +
+    '  button { margin-top: 10px; padding: 8px 20px; background: #1a73e8; color: white;' +
+    '           border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }' +
+    '  button:hover { background: #1558b0; }' +
+    '  #status { margin-top: 8px; font-size: 12px; color: #555; }' +
+    '</style>' +
+    '</head>' +
+    '<body>' +
+    '<p style="margin:0 0 6px 0"><strong>Paste your bank CSV below</strong> (include the header row):</p>' +
+    '<textarea id="csv" placeholder="Paste CSV text here..."></textarea>' +
+    '<br>' +
+    '<button onclick="doImport()">Import</button>' +
+    '<div id="status"></div>' +
+    '<script>' +
+    'function doImport() {' +
+    '  var csv = document.getElementById("csv").value.trim();' +
+    '  if (!csv) { document.getElementById("status").innerText = "Please paste CSV text first."; return; }' +
+    '  document.getElementById("status").innerText = "Importing...";' +
+    '  google.script.run' +
+    '    .withSuccessHandler(function(msg) {' +
+    '      document.getElementById("status").innerText = msg;' +
+    '    })' +
+    '    .withFailureHandler(function(err) {' +
+    '      document.getElementById("status").innerText = "Error: " + err.message;' +
+    '    })' +
+    '    .processCSVText(csv);' +
+    '}' +
+    '</script>' +
+    '</body>' +
+    '</html>'
+  )
+  .setWidth(560)
+  .setHeight(460)
+  .setTitle('Import CSV');
+
+  SpreadsheetApp.getUi().showModalDialog(html, 'Import CSV');
+}
+
+// ============================================================
+// SECTION 7: IMPORT PROCESSOR (called from the dialog)
 // ============================================================
 
 /**
- * Main entry point: reads staging tab, processes rows, writes to main sheet.
+ * Called from the HTML dialog with the raw CSV text string.
+ * Parses it entirely in-script — no Sheets cell mangling.
+ * Returns a status string shown in the dialog.
  */
-function runCsvImport() {
+function processCSVText(csvText) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var mainSheet = getOrCreateMainSheet(ss);
 
-  // Ensure all required tabs exist
-  var stagingSheet = getOrCreateStagingSheet(ss);
-  var mainSheet    = getOrCreateMainSheet(ss);
+  // Parse the raw CSV string into a 2D array
+  var rows = parseCSVText(csvText);
 
-  // Read staging tab data
-  var lastRow = stagingSheet.getLastRow();
-  var lastCol = stagingSheet.getLastColumn();
-
-  if (lastRow < 2) {
-    SpreadsheetApp.getUi().alert(
-      'No data found in the ' + STAGING_SHEET_NAME + ' tab.\n\n' +
-      'Please paste your CSV content starting at cell A1, then run the import again.'
-    );
-    return;
+  if (rows.length < 2) {
+    return 'No data found. Please paste a CSV with a header row and at least one data row.';
   }
 
-  // Read all values from staging tab
-  var allValues = stagingSheet.getRange(1, 1, lastRow, lastCol).getValues();
-
-  // --- Raw CSV detection ---
-  // When a user pastes a quoted CSV string into Sheets, the entire string
-  // lands in cell A1 as plain text (Sheets does NOT auto-parse it).
-  // Detect this by checking if only column A has data AND A1 looks like a
-  // CSV line. If so, re-parse column A rows ourselves.
-  if (lastCol === 1) {
-    var firstCell = String(allValues[0][0] || '');
-    if (firstCell.indexOf('"') !== -1 && firstCell.indexOf(',') !== -1) {
-      var reParsed = reParseRawCSV(stagingSheet);
-      if (!reParsed || reParsed.length === 0) {
-        SpreadsheetApp.getUi().alert(
-          'Could not parse the CSV text in the ' + STAGING_SHEET_NAME + ' tab.\n\n' +
-          'Please verify the CSV format is correct and try again.'
-        );
-        return;
-      }
-      allValues = reParsed;
-    }
-  }
-  // --- End raw CSV detection ---
-
-  // Build header → column index map from row 1
-  var headerRow = allValues[0];
+  // Build header → column index map
+  var headerRow = rows[0];
   var colIndex  = {};
-  headerRow.forEach(function(header, idx) {
-    colIndex[String(header).trim().toUpperCase()] = idx;
+  headerRow.forEach(function(h, idx) {
+    colIndex[h.trim().toUpperCase()] = idx;
   });
 
-  // Validate required columns are present
-  var requiredCols = ['DATE', 'TRANSACTION TYPE', 'DESCRIPTION', 'AMOUNT', 'ID'];
-  var missingCols = requiredCols.filter(function(col) {
-    return colIndex[col] === undefined;
-  });
-  if (missingCols.length > 0) {
-    SpreadsheetApp.getUi().alert(
-      'Missing required columns in the CSV:\n  ' + missingCols.join(', ') + '\n\n' +
-      'Please check that your CSV has these headers and try again.'
-    );
-    return;
+  // Validate required columns
+  var required = ['DATE', 'TRANSACTION TYPE', 'DESCRIPTION', 'AMOUNT', 'ID'];
+  var missing  = required.filter(function(c) { return colIndex[c] === undefined; });
+  if (missing.length > 0) {
+    return 'Missing required columns: ' + missing.join(', ') +
+           '\nFound: ' + Object.keys(colIndex).join(', ');
   }
 
-  // Load existing IDs for duplicate detection
+  // Load existing IDs
   var existingIds = loadExistingIds(ss);
 
-  // Process each data row
   var newRows  = [];
   var newIds   = [];
   var skipped  = 0;
   var errors   = [];
 
-  var importBatch = Utilities.formatDate(
-    new Date(),
-    ss.getSpreadsheetTimeZone(),
-    "yyyy-MM-dd'T'HH:mm:ss"
-  );
+  for (var r = 1; r < rows.length; r++) {
+    var row = rows[r];
 
-  for (var r = 1; r < allValues.length; r++) {
-    var row = allValues[r];
-
-    // Skip completely empty rows
-    if (row.every(function(cell) { return cell === '' || cell === null || cell === undefined; })) {
-      continue;
-    }
-
-    // Build a row object keyed by column name
+    // Build rowObj
     var rowObj = {};
-    headerRow.forEach(function(header, idx) {
-      rowObj[String(header).trim().toUpperCase()] = row[idx];
+    headerRow.forEach(function(h, idx) {
+      rowObj[h.trim().toUpperCase()] = row[idx] !== undefined ? row[idx] : '';
     });
 
     // Duplicate check
     var key = getRowKey(rowObj);
-    if (existingIds.has(key)) {
-      skipped++;
-      continue;
-    }
+    if (existingIds.has(key)) { skipped++; continue; }
 
-    // Parse fields
-    var dateStr  = String(rowObj['DATE'] || '').trim();
-    var dateObj  = parseSheetDate(dateStr);
+    // Parse date
+    var dateObj = parseSheetDate(rowObj['DATE']);
     if (!dateObj) {
-      errors.push('Row ' + (r + 1) + ': could not parse date "' + dateStr + '"');
+      errors.push('Row ' + (r + 1) + ': bad date "' + rowObj['DATE'] + '"');
       continue;
     }
 
-    var amountRaw = rowObj['AMOUNT'];
-    // Sheets may have already parsed the currency to a number during paste
-    var amount;
-    if (typeof amountRaw === 'number') {
-      amount = amountRaw;
-    } else {
-      amount = parseCurrency(String(amountRaw || ''));
-      if (isNaN(amount)) {
-        errors.push('Row ' + (r + 1) + ': could not parse amount "' + amountRaw + '"');
-        continue;
-      }
+    // Parse amount
+    var amount = parseCurrency(rowObj['AMOUNT']);
+    if (isNaN(amount)) {
+      errors.push('Row ' + (r + 1) + ': bad amount "' + rowObj['AMOUNT'] + '"');
+      continue;
     }
 
-    var type        = String(rowObj['TRANSACTION TYPE'] || '').trim();
+    var type        = rowObj['TRANSACTION TYPE'] || '';
     var description = normalizeDescription(rowObj['DESCRIPTION']);
-    var status      = String(rowObj['STATUS'] || '').trim();
+    var status      = rowObj['STATUS'] || '';
     var monthKey    = toMonthKey(dateObj);
 
-    // Build output row matching MAIN_HEADERS order:
-    // Date | Type | Description | Amount | Status | Month | Category
     newRows.push([dateObj, type, description, amount, status, monthKey, '']);
     newIds.push(key);
-    existingIds.add(key); // Prevent intra-batch duplicates
+    existingIds.add(key);
   }
 
-  // Batch write new rows to main sheet
   if (newRows.length > 0) {
     var firstNewRow = mainSheet.getLastRow() + 1;
-    mainSheet
-      .getRange(firstNewRow, 1, newRows.length, MAIN_HEADERS.length)
-      .setValues(newRows);
+    mainSheet.getRange(firstNewRow, 1, newRows.length, MAIN_HEADERS.length).setValues(newRows);
     saveNewIds(ss, newIds);
     applyMainSheetFormatting(mainSheet);
   }
 
-  // Show summary
-  var summary = 'Import complete!\n\n' +
-    '  Rows imported: ' + newRows.length + '\n' +
-    '  Duplicates skipped: ' + skipped;
+  var summary = 'Done!  Imported: ' + newRows.length + '  |  Duplicates skipped: ' + skipped;
   if (errors.length > 0) {
-    summary += '\n  Errors (' + errors.length + '):\n    ' + errors.slice(0, 5).join('\n    ');
-    if (errors.length > 5) summary += '\n    ... and ' + (errors.length - 5) + ' more';
+    summary += '\nErrors (' + errors.length + '): ' + errors.slice(0, 3).join('; ');
+    if (errors.length > 3) summary += ' ... and ' + (errors.length - 3) + ' more';
   }
-  SpreadsheetApp.getUi().alert(summary);
-}
-
-// ============================================================
-// SECTION 6: UTILITY
-// ============================================================
-
-/**
- * Clears the staging tab content (keeps the tab, removes data).
- */
-function clearStagingTab() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var stagingSheet = ss.getSheetByName(STAGING_SHEET_NAME);
-  if (!stagingSheet) {
-    SpreadsheetApp.getUi().alert(STAGING_SHEET_NAME + ' tab not found.');
-    return;
-  }
-  stagingSheet.clearContents();
-  stagingSheet.getRange('A1').setValue(
-    'Paste your bank CSV here starting at cell A1. Row 1 must be the header row.'
-  );
-  SpreadsheetApp.getActiveSpreadsheet().toast('Staging tab cleared.', 'Done', 3);
+  return summary;
 }
